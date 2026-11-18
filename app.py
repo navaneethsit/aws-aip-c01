@@ -16,7 +16,33 @@ import os
 import re
 import time
 
+import importlib
+
 import streamlit as st
+
+
+def _stale(module: str, needs: list[str]) -> str | None:
+    """Streamlit Cloud redacts import errors, so say which uploaded file is missing or out of date."""
+    try:
+        m = importlib.import_module(module)
+    except Exception as e:
+        return f"`{module}.py` is missing or broken ({type(e).__name__}) — upload it"
+    gone = [n for n in needs if not hasattr(m, n)]
+    return f"`{module}.py` is out of date (missing `{'`, `'.join(gone)}`) — re-upload the newest copy" if gone else None
+
+
+_problems = [p for p in (
+    _stale("engine", ["Index", "decide"]),
+    _stale("scan", ["prepare_image", "read_photo", "judge_match", "ScanError"]),
+    _stale("components_ui", ["back_camera", "auth_store"]),
+    _stale("questions", ["QUESTIONS"]),
+) if p]
+if _problems:
+    st.set_page_config(page_title="AIP-C01 Q&A", page_icon="🔎")
+    st.error("**Some files in the repo are not the latest versions:**\n\n" + "\n".join(f"- {p}" for p in _problems)
+             + "\n\nUpload the newest `app.py`, `engine.py`, `scan.py`, `components_ui.py` and `requirements.txt`, "
+               "then reboot the app (⋮ → Reboot).")
+    st.stop()
 
 import components_ui
 import scan
