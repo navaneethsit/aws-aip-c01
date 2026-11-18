@@ -1147,8 +1147,9 @@ EXTRA: list[dict] = [
             "dashboard.",
         ],
         "answer": [
-                      'B. Import the datasets to an Amazon S3 bucket. Provide appropriate IAM permissions and a VPC'
-                      ' endpoint configuration to give the evaluation jobs access to the datasets.',
+                      'A. Import the datasets to an Amazon S3 bucket. Provide appropriate IAM permissions and '
+                      'cross-origin resource sharing (CORS) permissions to give the evaluation jobs access to the '
+                      'datasets.',
                       'C. Configure an AWS Lambda function to create model evaluation jobs on a schedule in the '
                       'Amazon Bedrock console. Provide the URI of the S3 bucket that contains the datasets as an '
                       'input. Configure the evaluation jobs to measure the real world knowledge (RWK) score for '
@@ -1158,22 +1159,23 @@ EXTRA: list[dict] = [
                   ],
         "explanation": 'Use the **managed Bedrock Model Evaluations** feature instead of building an evaluation '
                        'harness. Two parts:\\n'
-                       '- **Data access (B):** put the custom datasets in S3 and give the evaluation job IAM access '
-                       'to them (with VPC endpoint configuration where the organisation requires private access).\\n'
+                       '- **Data access (A):** put the custom datasets in S3 and give the evaluation job IAM access '
+                       "to them, plus the CORS configuration that Bedrock's console-based evaluation setup expects "
+                       'on the dataset/output buckets.\\n'
                        '- **Running + reporting (C):** Lambda creates scheduled evaluation jobs using the built-in '
                        'accuracy metrics — **RWK score (text generation)** and **BERTScore (summarization)** — and a'
                        ' second Lambda publishes job status/results to CloudWatch for a dashboard.\\n'
                        '\\n'
-                       '**A** CORS permissions are, per the current Bedrock docs, only required on the output bucket'
-                       " of *human-based* evaluation jobs; automated jobs don't need them. **D** Clarify is a "
-                       "bias/explainability tool, and word error rate (speech) and toxicity aren't accuracy metrics "
-                       'for these tasks. **E** a self-built notebook harness with direct InvokeModel calls is the '
-                       'highest overhead.',
+                       '**B** a VPC endpoint is not part of how Bedrock evaluation jobs read S3 datasets (no AWS '
+                       'evaluation doc describes it). **D** Clarify is a bias/explainability tool, and word error '
+                       "rate (speech) and toxicity aren't accuracy metrics for these tasks. **E** a self-built "
+                       'notebook harness with direct InvokeModel calls is the highest overhead.',
         "reference": f"{_BR}/model-evaluation-prompt-datasets.html",
-        "note": 'Changed to B + C. Two sources (your earlier pasted site and the second dump) say B + C, '
-                "while CertyIQ's key says A + C. The Bedrock docs only require CORS for human-based "
-                'evaluation jobs, so A is the weaker option. C is agreed by every source. Moderate confidence'
-                ' on B.'
+        "note": "Back to A + C (CertyIQ's key, confirmed from its own page). C is agreed by every source. For"
+                ' the other half, a second dump said B and the AWS docs are mixed on CORS: the custom-dataset'
+                " page says CORS isn't required for automated jobs, while the console setup guidance lists "
+                'CORS on the buckets; no AWS doc found mentions VPC endpoints for dataset access. '
+                'Moderate-high confidence in A over B.'
     },
     {
         "id": 35,

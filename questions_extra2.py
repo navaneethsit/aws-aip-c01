@@ -27,22 +27,24 @@ EXTRA2: list[dict] = [
             "C. Deploy Amazon OpenSearch Service that has k-nearest neighbor (k-NN) capabilities to store query-response text pairs. Use an approximate k-NN technique to find similar queries and their responses.",
             "D. Create a caching solution by using Amazon DynamoDB to create a global secondary index on the normalized query text. Apply stemming to incoming queries. Query the index of cached customer queries.",
         ],
-        "answer": 'C. Deploy Amazon OpenSearch Service that has k-nearest neighbor (k-NN) capabilities to store'
-                  ' query-response text pairs. Use an approximate k-NN technique to find similar queries and '
-                  'their responses.',
-        "explanation": 'A **semantic cache** stores past query→response pairs and, for a new query, finds a '
-                       '*semantically similar* earlier query and returns its stored answer instead of calling the FM'
-                       ' again. OpenSearch Service with **k-NN vector search** does exactly that: approximate k-NN '
-                       'finds paraphrases of the same question quickly, so semantically equivalent questions get '
-                       'consistent answers at low latency.\\n'
+        "answer": 'B. Use Amazon Bedrock to generate embeddings from customer queries. Use Amazon MemoryDB for '
+                  'Valkey to store hash sets of vector embeddings and model responses. Use a RANGE query to '
+                  'find similar queries and their responses.',
+        "explanation": 'A **semantic cache** needs (1) an **embedding** of each incoming question and (2) a fast '
+                       '**similarity lookup** over previously answered questions. B does both: Bedrock generates the'
+                       ' embeddings, and **MemoryDB** keeps vectors and responses **in memory** (lowest latency) '
+                       'with vector search; a **range (radius) query** returns cached questions within a similarity '
+                       'threshold, so paraphrased questions get the same stored answer without a new model call '
+                       '(exam-guide Skill 4.1.4).\\n'
                        '\\n'
-                       '**A** DAX caches DynamoDB items by exact key and has no LIKE/semantic matching. **D** a GSI '
-                       'on normalised text with stemming only catches trivial wording differences, not paraphrases. '
-                       '**B** (MemoryDB for Valkey with vector search) is also a semantic-cache design and the close'
-                       ' alternative; the answer key prefers OpenSearch k-NN.',
+                       '**A** DAX caches DynamoDB items by exact key; there is no LIKE/semantic matching. **C** '
+                       'stores only *text* pairs and never creates embeddings, yet k-NN search needs vectors; a '
+                       'disk-based OpenSearch domain is also slower than in-memory. **D** stemming catches spelling '
+                       'variants, not paraphrases.',
         "reference": "https://docs.aws.amazon.com/memorydb/latest/devguide/vector-search-overview.html",
-        "note": 'Answer changed to C to match the CertyIQ answer key (my first derivation was B, MemoryDB). '
-                'Both are semantic-cache designs; B is the close alternative.'
+        "note": "Cross-check: changed back to B. CertyIQ's key says C, but C never generates embeddings (k-NN"
+                " can't run on raw text pairs), while MemoryDB's in-memory vector search (which supports "
+                'range queries) is the lower-latency semantic cache. Moderate confidence.'
     },
     {
         "id": 52, "category": D2, "task": "2.1", "type": "single",

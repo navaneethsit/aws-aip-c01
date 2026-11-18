@@ -109,29 +109,31 @@ EXTRA3: list[dict] = [
             "E. Use AWS CloudFormation to create a custom Amazon Bedrock guardrail that has a mask filtering policy. Use stack sets to deploy the guardrail to each account in the organization.",
         ],
         "answer": [
-                      'B. Create an SCP that allows employees to use only approved models. Configure the SCP to '
-                      'require employees to specify a guardrail identifier in calls to invoke an approved model.',
-                      'E. Use AWS CloudFormation to create a custom Amazon Bedrock guardrail that has a mask '
+                      'C. Create an SCP that prevents an employee from invoking a model if a centrally deployed '
+                      'guardrail identifier is not specified in a call to the model. Create a permissions boundary '
+                      "on each employee's IAM role that allows each employee to invoke only approved models.",
+                      'D. Use AWS CloudFormation to create a custom Amazon Bedrock guardrail that has a block '
                       'filtering policy. Use stack sets to deploy the guardrail to each account in the '
                       'organization.',
                   ],
-        "explanation": 'Two jobs: **(1) enforce, organization-wide,** that every call uses an approved model *and* a'
-                       ' guardrail — one **SCP** with the `bedrock:GuardrailIdentifier` condition plus an '
-                       'approved-model allow-list (B); **(2) deploy the same guardrail to every account** with '
-                       '**CloudFormation StackSets** (E), configured with a **mask** filtering policy so specific '
-                       'topics/proprietary text are masked out of what reaches the model while legitimate requests '
-                       'still go through (a block policy would reject them outright).\\n'
+        "explanation": 'Two controls:\\n'
+                       '- **Enforce the guardrail org-wide (C):** an **SCP** that denies model invocation unless '
+                       '`bedrock:GuardrailIdentifier` equals the **centrally deployed guardrail**. This is the '
+                       'pattern AWS documents (an explicit Deny for any other guardrail). Because IAM roles are '
+                       'centrally managed, a **permissions boundary** on each role limits them to the approved '
+                       'models.\\n'
+                       '- **Deploy the guardrail everywhere (D):** CloudFormation **StackSets** create the same '
+                       'guardrail in every account with a **BLOCK** policy. Denied topics support only BLOCK (or '
+                       'detect), so blocking is what keeps specific topics and proprietary terms out of prompts.\\n'
                        '\\n'
-                       '**A/C** add a per-role permissions boundary on top of the SCP — redundant management when an'
-                       ' SCP already covers every account. **D** is the same StackSets deployment but with a *block*'
-                       ' policy; the answer key prefers mask.',
+                       '**B** only requires *a* guardrail identifier, so an employee could pass any permissive '
+                       'guardrail. **A** puts the guardrail requirement in per-role boundaries instead of an '
+                       'organization-wide SCP. **E** a mask policy cannot apply to denied topics.',
         "reference": f"{_BR}/guardrails-permissions.html",
-        "note": 'Answer changed to B + E to match the CertyIQ answer key (my first derivation was B + D). The'
-                ' only difference is mask vs block in the deployed guardrail. A second dump '
-                '(resources/1.text) says C + D (SCP deny-unless-guardrail + permissions boundary, '
-                'block-policy guardrail). Three sources give three answers (B+D mine originally, B+E CertyIQ,'
-                ' C+D second dump); B + E is kept as the CertyIQ answer. The common ground is an SCP that '
-                'requires the guardrail plus a StackSets-deployed guardrail.'
+        "note": 'Cross-check: changed to C + D. Sources disagreed (CertyIQ B + E, second dump C + D, my first'
+                ' pass B + D). The AWS API settles the guardrail half: denied topics allow only BLOCK or NONE'
+                " (no masking), so E can't meet 'prevent specific topics'. C names the centrally deployed "
+                "guardrail, which matches AWS's documented enforcement pattern. Moderate-high confidence."
     },
     {
         "id": 82, "category": D2, "task": "2.5", "type": "single",
