@@ -1,27 +1,26 @@
 """
-AIP-C01 Question & Answer Browser — every question with its choices and correct answer,
-plus a search box. No mock exam, no timer, no scoring.
-
-Search rules
-  * whole words only (so "a" never matches inside "application"); simple plurals are tolerated
-  * filler words (a, the, to, is, ...) are ignored, so you can paste a sentence from a question
-  * every remaining word must appear; "quoted phrases" must appear exactly; #82 = question number
-  * results are ranked by relevance (rarer words and hits in the question text count more)
-  * if no question contains every word, the closest matches are shown with a % match
+AIP-C01 Question & Answer Browser
+  * 📷 Scan: photograph a question from ANY practice set (answers not needed); a vision model reads it,
+    and if it is in this bank you get the question and the answer.
+  * 🔎 Browse: every question with its choices and correct answer, plus whole-word search.
+No mock exam, no timer, no scoring. Works on a phone.
 
 Run locally:   streamlit run app.py
 Deploy:        Streamlit Community Cloud (see README.md)
 """
+import hashlib
+import hmac
 import html
-import math
+import os
 import re
-from collections import Counter
 
 import streamlit as st
 
+import scan
+from engine import PROBABLE, SURE, Index, band
 from questions import QUESTIONS
 
-st.set_page_config(page_title="AIP-C01 Q&A", page_icon="🔎", layout="wide")
+st.set_page_config(page_title="AIP-C01 Q&A", page_icon="🔎", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown(
     """
@@ -52,123 +51,38 @@ st.markdown(
       .qa-foot{margin-top:10px;display:flex;gap:14px;flex-wrap:wrap;font-size:.8rem;opacity:.75;}
       .qa-foot a{color:inherit;}
       mark{background:rgba(255,213,0,.55);color:inherit;border-radius:3px;padding:0 1px;}
+      .scan-ans{margin:10px 0 14px;padding:14px 16px;border-radius:12px;font-size:1.25rem;font-weight:700;
+        background:rgba(46,160,67,.16);border:2px solid rgba(46,160,67,.6);}
+      .scan-ans small{display:block;margin-top:4px;font-size:.85rem;font-weight:500;opacity:.85;}
+      @media (max-width: 640px){
+        .block-container{padding:1rem .7rem 3rem;}
+        .qa-card{padding:12px;border-radius:10px;}
+        .qa-opt{padding:8px 9px;gap:8px;font-size:.95rem;}
+        .qa-opt .tick{display:none;}      /* the green background already marks the answer */
+        .scan-ans{font-size:1.1rem;padding:12px;}
+      }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# --------------------------------------------------------------------------- #
-# Text handling
-# --------------------------------------------------------------------------- #
-STOP = set(
-    "a an the of to in on for and or is are was were be been being with by as at from that this these those "
-    "it its into than then so such do does did have has had can could should would will may might must which "
-    "who whom whose what when where why how their there they them we you your our us i if but about over under "
-    "per via also any all each other some more most only both between within without after before up out off "
-    "not no yes".split()
-)
+
+@st.cache_resource
+def get_index() -> Index:
+    return Index(QUESTIONS)
 
 
-def tokens(s: str) -> list[str]:
-    return re.findall(r"[a-z0-9]+", s.lower())
+IDX = get_index()
+DOMAINS = list(dict.fromkeys(q["category"] for q in IDX.items))
+SCAN_VIEW, BROWSE_VIEW = "📷 Scan a question", "🔎 Browse & search"
 
 
-def stem(w: str) -> str:
-    """Tolerate simple plurals: guardrails -> guardrail, responses -> response."""
-    return w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w
-
-
-# --------------------------------------------------------------------------- #
-# Index
-# --------------------------------------------------------------------------- #
-@st.cache_data
-def load_index():
-    items, df = [], Counter()
-    for q in sorted(QUESTIONS, key=lambda x: x["id"]):
-        answers = [q["answer"]] if q["type"] == "single" else list(q["answer"])
-        correct = {a[0] for a in answers}
-        opts = [{"letter": o[0], "text": o[3:].strip(), "ok": o[0] in correct} for o in q["options"]]
-        q_toks = tokens(q["question"])
-        o_toks = tokens(" ".join(o["text"] for o in opts))
-        x_toks = tokens(" ".join([q.get("explanation", ""), q.get("note", ""), q["category"],
-                                  q.get("reference", ""), " ".join(sorted(correct))]))
-        q_s, o_s, x_s = ({stem(t) for t in ts} for ts in (q_toks, o_toks, x_toks))
-        for s in q_s | o_s | x_s:
-            df[s] += 1
-        items.append({
-            **q, "opts": opts, "correct": sorted(correct),
-            "q_s": q_s, "o_s": o_s, "x_s": x_s,
-            "main_norm": " " + " ".join(q_toks + o_toks) + " ",
-            "all_norm": " " + " ".join(q_toks + o_toks + x_toks) + " ",
-        })
-    return items, dict(df)
-
-
-ITEMS, DF = load_index()
-N = len(ITEMS)
-DOMAINS = list(dict.fromkeys(q["category"] for q in ITEMS))
-IDS = {q["id"] for q in ITEMS}
-
-
-def idf(s: str) -> float:
-    return math.log(1 + N / (1 + DF.get(s, 0)))
-
-
-# --------------------------------------------------------------------------- #
-# Search
-# --------------------------------------------------------------------------- #
-def parse(query: str):
-    phrases = [" " + " ".join(tokens(p)) + " " for p in re.findall(r'"([^"]+)"', query) if tokens(p)]
-    rest = re.sub(r'"[^"]*"', " ", query)
-    ids = {int(n) for n in re.findall(r"#(\d+)", rest)}
-    rest = re.sub(r"#\d+", " ", rest)
-    words, seen = [], set()                      # (what the user typed, stem)
-    for t in tokens(rest):
-        if t in STOP or (len(t) == 1 and not t.isdigit()):
-            continue
-        s = stem(t)
-        if s not in seen:
-            seen.add(s)
-            words.append((t, s))
-    return words, phrases, ids
-
-
-def has_word(q: dict, s: str) -> int:
-    """0 = absent, else a boost: 3 question text, 2 options, 1 explanation/other."""
-    if s in q["q_s"]:
-        return 3
-    if s in q["o_s"]:
-        return 2
-    if s in q["x_s"]:
-        return 1
-    m = re.fullmatch(r"q?(\d+)", s)               # "82" / "q82" also hit question number 82
-    return 3 if m and int(m.group(1)) == q["id"] else 0
-
-
-def search(items, query: str):
-    words, phrases, ids = parse(query)
-    if not (words or phrases or ids):
-        return items, "all", {}, words, phrases
-    total_w = sum(idf(s) for _, s in words) or 1.0
-    scored = []
-    for q in items:
-        if ids and q["id"] not in ids:
-            continue
-        if any(p not in q["all_norm"] for p in phrases):
-            continue
-        hit = {s: has_word(q, s) for _, s in words}
-        got = sum(idf(s) for s, b in hit.items() if b)
-        score = sum(idf(s) * b for s, b in hit.items() if b) + 4 * len(phrases)
-        scored.append((q, hit, got / total_w, score))
-    strict = [x for x in scored if all(x[1].values())]
-    if strict or len(words) < 2:
-        strict.sort(key=lambda x: (-x[3], x[0]["id"]))
-        return [x[0] for x in strict], "exact", {x[0]["id"]: (1.0, []) for x in strict}, words, phrases
-    near = [x for x in scored if x[2] >= 0.5 and sum(1 for b in x[1].values() if b) >= 2]
-    near.sort(key=lambda x: (-x[2], -x[3], x[0]["id"]))
-    near = near[:15]
-    info = {x[0]["id"]: (x[2], [t for t, s in words if not x[1][s]]) for x in near}
-    return [x[0] for x in near], "closest", info, words, phrases
+def secret(name: str, default=None):
+    try:
+        v = st.secrets.get(name)
+    except Exception:
+        v = None
+    return v or os.environ.get(name, default)
 
 
 # --------------------------------------------------------------------------- #
@@ -214,7 +128,7 @@ def md_lite(text: str, mk) -> str:
     return fin("".join(out))
 
 
-def card(q: dict, mk, expand: bool, words, phrases, extra: tuple | None) -> str:
+def card(q: dict, mk=lambda t: t, expand=False, words=(), phrases=(), pct: float | None = None, miss=()) -> str:
     paras = "".join(f"<p>{fin(esc(mk(p)))}</p>" for p in q["question"].split("\n") if p.strip())
     opts = "".join(
         f'<li class="qa-opt{" ok" if o["ok"] else ""}"><span class="l">{o["letter"]}.</span>'
@@ -233,15 +147,13 @@ def card(q: dict, mk, expand: bool, words, phrases, extra: tuple | None) -> str:
     note = f'<div class="qa-note"><strong>Note:</strong> {fin(esc(mk(q["note"])))}</div>' if q.get("note") else ""
     task = f'<span class="qa-badge">Task {esc(q["task"])}</span>' if q.get("task") else ""
     multi = f'<span class="qa-badge multi">Choose {len(q["correct"])}</span>' if q["type"] == "multi" else ""
-    pct = miss = ""
-    if extra and extra[0] < 1.0:
-        pct = f'<span class="qa-badge pct">{round(extra[0] * 100)}% match</span>'
-        miss = (f'<div class="qa-miss">Not found in this question: {esc(", ".join(extra[1]))}</div>' if extra[1] else "")
+    badge = f'<span class="qa-badge pct">{round(pct * 100)}% match</span>' if pct is not None and pct < 1.0 else ""
+    missing = f'<div class="qa-miss">Not found in this question: {esc(", ".join(miss))}</div>' if miss else ""
     return (
         f'<div class="qa-card" id="q{q["id"]}"><div class="qa-meta"><span class="qa-badge id">Q{q["id"]}</span>'
-        f'<span class="qa-badge">{esc(q["category"])}</span>{task}{multi}{pct}</div>'
+        f'<span class="qa-badge">{esc(q["category"])}</span>{task}{multi}{badge}</div>'
         f'<div class="qa-q">{paras}</div><ul class="qa-opts">{opts}</ul>'
-        f'<div class="qa-ans">Answer: {", ".join(q["correct"])}</div>{miss}'
+        f'<div class="qa-ans">Answer: {", ".join(q["correct"])}</div>{missing}'
         f'<details class="qa-ex"{open_attr}><summary>Explanation</summary>'
         f'<div class="qa-exb">{md_lite(q.get("explanation", ""), mk)}</div></details>'
         f'{note}<div class="qa-foot">{votes}{ref}</div></div>'
@@ -249,50 +161,224 @@ def card(q: dict, mk, expand: bool, words, phrases, extra: tuple | None) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# UI
+# 🔎 Browse & search
 # --------------------------------------------------------------------------- #
-if "q" not in st.session_state:
-    st.session_state.q = st.query_params.get("q", "")
+def browse_view():
+    if "q" not in st.session_state:
+        st.session_state.q = st.query_params.get("q", "")
 
-st.subheader("AIP-C01 · Question & Answer Browser")
+    c1, c2, c3 = st.columns([5, 2, 2], vertical_alignment="center")
+    query = c1.text_input(
+        "Search", key="q", label_visibility="collapsed",
+        placeholder='Search, or paste a question…   e.g.  guardrails  |  "least operational overhead"  |  #82',
+    )
+    qtype = c2.selectbox("Type", ["All types", "Choose one", "Choose two or more"], label_visibility="collapsed")
+    expand = c3.toggle("Show explanations", value=False)
+    domains = st.multiselect("Domains", DOMAINS, placeholder="All domains", label_visibility="collapsed")
 
-c1, c2, c3 = st.columns([5, 2, 2], vertical_alignment="center")
-query = c1.text_input(
-    "Search", key="q", label_visibility="collapsed",
-    placeholder='Search, or paste a question…   e.g.  guardrails  |  "least operational overhead"  |  #82',
-)
-qtype = c2.selectbox("Type", ["All types", "Choose one", "Choose two or more"], label_visibility="collapsed")
-expand = c3.toggle("Show explanations", value=False)
-domains = st.multiselect("Domains", DOMAINS, placeholder="All domains", label_visibility="collapsed")
+    if query:
+        st.query_params["q"] = query
+    elif "q" in st.query_params:
+        del st.query_params["q"]
 
-if query:
-    st.query_params["q"] = query
-elif "q" in st.query_params:
-    del st.query_params["q"]
+    pool = [
+        q for q in IDX.items
+        if (not domains or q["category"] in domains)
+        and (qtype == "All types" or (qtype == "Choose one") == (q["type"] == "single"))
+    ]
+    results, mode, info, words, phrases = IDX.search(pool, query)
+    mk = make_marker(words, phrases)
 
-pool = [
-    q for q in ITEMS
-    if (not domains or q["category"] in domains)
-    and (qtype == "All types" or (qtype == "Choose one") == (q["type"] == "single"))
-]
-results, mode, info, words, phrases = search(pool, query)
-mk = make_marker(words, phrases)
-
-if mode == "all":
-    st.caption(f"Showing **{len(results)}** of {N} questions · answers are shown on every card")
-else:
-    used = " · ".join([f"`{t}`" for t, _ in words] + [f'"{p.strip()}"' for p in phrases]
-                      + [f"`#{i}`" for i in sorted(parse(query)[2])])
-    skipped = "whole words only · filler words like *a, the, to, is* are ignored · simple plurals match"
-    if mode == "exact":
-        st.caption(f"**{len(results)}** of {N} questions contain all of: {used}  ·  best match first  ·  {skipped}")
-    elif results:
-        st.warning(f"No question contains every word of: {used}. Showing the **{len(results)} closest** "
-                   f"(best first, with % of your words found). Tip: quote a phrase or drop a word to narrow it.")
+    if mode == "all":
+        st.caption(f"Showing **{len(results)}** of {IDX.n} questions · answers are shown on every card")
     else:
-        st.info(f"Nothing matches {used}. Try fewer or different words.")
+        used = " · ".join([f"`{t}`" for t, _ in words] + [f'"{p.strip()}"' for p in phrases]
+                          + [f"`#{i}`" for i in sorted(IDX.parse(query)[2])])
+        skipped = "whole words only · filler words like *a, the, to, is* are ignored · simple plurals match"
+        if mode == "exact":
+            st.caption(f"**{len(results)}** of {IDX.n} questions contain all of: {used}  ·  best match first  ·  {skipped}")
+        elif results:
+            st.warning(f"No question contains every word of: {used}. Showing the **{len(results)} closest** "
+                       f"(best first, with % of your words found). Tip: quote a phrase or drop a word to narrow it.")
+        else:
+            st.info(f"Nothing matches {used}. Try fewer or different words.")
 
-if results:
-    st.markdown("".join(card(q, mk, expand, words, phrases, info.get(q["id"])) for q in results), unsafe_allow_html=True)
-elif mode == "exact":
-    st.info("No questions match. Try fewer or different words, or clear the filters.")
+    if results:
+        st.markdown("".join(card(q, mk, expand, words, phrases, *info.get(q["id"], (None, ()))) for q in results),
+                    unsafe_allow_html=True)
+    elif mode == "exact":
+        st.info("No questions match. Try fewer or different words, or clear the filters.")
+
+
+# --------------------------------------------------------------------------- #
+# 📷 Scan a question
+# --------------------------------------------------------------------------- #
+@st.cache_data(show_spinner=False, max_entries=30)
+def analyze_photo(jpeg: bytes, model: str, attempt: int, _key: str) -> dict:
+    """Cached per image, so editing the text or re-running never re-bills the API.
+    `attempt` is part of the cache key: 'Read again' bumps it to force a fresh read."""
+    return scan.read_photo(jpeg, _key, model)
+
+
+def parse_options_text(text: str) -> list[tuple[str, str]]:
+    """'A. foo\\nB. bar' (as edited by the user) -> [('A','foo'), ('B','bar')]."""
+    out, plain = [], []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        m = re.match(r"^\s*([A-Fa-f])\s*[\.\)\:]\s*(.*)$", line)
+        if m:
+            out.append([m.group(1).upper(), m.group(2).strip()])
+        elif out:
+            out[-1][1] += " " + line.strip()
+        else:
+            plain.append(line.strip())
+    if not out and plain:                         # no letters at all: one option per line
+        out = [[chr(65 + i), t] for i, t in enumerate(plain)]
+    return [(l, t) for l, t in out if t]
+
+
+def show_match(matches: list[dict], options: list[tuple[str, str]]):
+    best = matches[0]
+    b, pct = band(best["score"]), round(best["score"] * 100)
+    q = IDX.by_id[best["id"]]
+    photo_text = dict(options)
+
+    if b == "none":
+        st.error(f"❌ **Not found in this bank.** The closest question is Q{q['id']} at only {pct}% — "
+                 "probably a different question. (If the AI misread the photo, fix the text below.)")
+        with st.expander(f"Closest question anyway: Q{q['id']} ({pct}%)"):
+            st.markdown(card(q, pct=best["score"]), unsafe_allow_html=True)
+        return
+
+    (st.success if b == "sure" else st.warning)(
+        f"{'✅ Found in the bank' if b == 'sure' else '🟡 Probably this one — compare the wording'}"
+        f" — **Q{q['id']}** · {pct}% match")
+
+    letters = ", ".join(q["correct"])
+    mapped = [best["to_photo"].get(c) for c in q["correct"]]
+    extra = ""
+    if all(mapped):
+        pl = ", ".join(sorted(mapped))
+        snippet = (photo_text.get(mapped[0], "")[:70] + "…") if len(mapped) == 1 and photo_text.get(mapped[0]) else ""
+        extra = (f"<small>In your photo that is option <b>{pl}</b>" + (f": “{esc(snippet)}”" if snippet else "") + "</small>")
+    st.markdown(f'<div class="scan-ans">Answer: {letters}{extra}</div>', unsafe_allow_html=True)
+    st.markdown(card(q, pct=best["score"]), unsafe_allow_html=True)
+
+    others = [m for m in matches[1:3] if band(m["score"]) != "none"]
+    if others:
+        with st.expander("Other close matches"):
+            for m in others:
+                st.markdown(card(IDX.by_id[m["id"]], pct=m["score"]), unsafe_allow_html=True)
+
+
+def scan_view():
+    st.caption("Take a photo of a question from **any** practice set — the answer doesn't need to be shown. "
+               "I'll read it and look it up in this bank.")
+
+    key = secret("OPENAI_API_KEY") or st.session_state.get("manual_key")
+    model = secret("OPENAI_MODEL", scan.DEFAULT_MODEL)
+    pw = secret("APP_PASSWORD")
+
+    if pw and not st.session_state.get("unlocked"):
+        entered = st.text_input("Passcode to use the photo scanner", type="password", key="pw_in")
+        if entered:
+            if hmac.compare_digest(entered.encode(), str(pw).encode()):
+                st.session_state.unlocked = True
+                st.rerun()
+            st.error("Wrong passcode.")
+        return
+    if not key:
+        with st.expander("🔑 Photo scanning needs an OpenAI API key", expanded=True):
+            st.markdown("Add `OPENAI_API_KEY` in the app's **Secrets** (Streamlit Cloud → ⋮ → Settings → Secrets), "
+                        "or paste a key here for this session only (it isn't stored).")
+            k = st.text_input("OpenAI API key", type="password", key="manual_key_in")
+            if k:
+                st.session_state.manual_key = k
+                st.rerun()
+        st.caption("Meanwhile you can still paste a question's text under **🔎 Browse & search**.")
+        return
+
+    # Two states: no photo yet -> show the camera/upload inputs; photo taken -> hide them so the
+    # result sits at the top of the screen (important on a phone), with a button to scan another.
+    photo = st.session_state.get("scan_img")
+    if photo is None:
+        t_up, t_cam = st.tabs(["📸 Take photo / upload", "🎥 Live camera"])
+        with t_up:
+            up = st.file_uploader("Take a photo or choose an image", key="scan_up", label_visibility="collapsed",
+                                  type=["jpg", "jpeg", "png", "webp", "heic", "heif"])
+            st.caption("On a phone this opens your camera app — best quality. Good light, fill the frame, hold steady.")
+        with t_cam:
+            cam = st.camera_input("Point the camera at the question", key="scan_cam", label_visibility="collapsed")
+            st.caption("If the camera doesn't start, allow camera access for this site, or use *Take photo / upload*.")
+        picked = cam or up
+        if picked is not None:
+            st.session_state.scan_img = picked.getvalue()
+            st.rerun()
+        st.info("**Tips:** one question per photo · include the whole question *and* all options · "
+                "avoid glare on screens · a blurry photo is fine as long as the words are legible.")
+        return
+
+    def scan_another(where: str):
+        if st.button("📷 Scan another question", use_container_width=True, type="primary", key=f"another_{where}"):
+            st.session_state.pop("scan_img", None)
+            st.rerun()
+
+    scan_another("top")
+    sig = hashlib.sha1(photo).hexdigest()[:10]
+
+    with st.expander("Your photo", expanded=False):
+        st.image(photo, use_container_width=True)
+
+    attempt = st.session_state.get(f"try_{sig}", 0)
+
+    def read_again(label: str, k: str):
+        if st.button(label, key=k):
+            st.session_state[f"try_{sig}"] = attempt + 1
+            for name in [n for n in st.session_state if n.startswith((f"stem_{sig}", f"opts_{sig}"))]:
+                del st.session_state[name]
+            st.rerun()
+
+    try:
+        with st.spinner("Reading the photo…"):
+            res = analyze_photo(scan.prepare_image(photo), model, attempt, key)
+    except scan.ScanError as e:
+        st.error(str(e))
+        read_again("🔄 Try again", f"retry_err_{sig}")
+        res = None
+
+    if res is not None and not res["questions"]:
+        st.warning("I couldn't read a question in that photo." + (f" ({res['problem']})" if res["problem"] else "")
+                   + " Try again closer, flatter and with more light, or read this photo once more.")
+        read_again("🔄 Read this photo again", f"retry_empty_{sig}")
+    for i, q in enumerate(res["questions"] if res else []):
+        if len(res["questions"]) > 1:
+            st.markdown(f"##### Question {i + 1} in the photo")
+        if q["readability"] != "clear":
+            st.caption("⚠️ Parts of this photo were hard to read — check the text below.")
+        sk, ok = f"stem_{sig}_{i}", f"opts_{sig}_{i}"
+        st.session_state.setdefault(sk, q["question"])
+        st.session_state.setdefault(ok, "\n".join(f"{l}. {t}" for l, t in q["options"]))
+        options = parse_options_text(st.session_state[ok])
+        matches = IDX.match_photo(st.session_state[sk], options)
+        if matches and matches[0]["score"] > 0:
+            show_match(matches, options)
+        else:
+            st.error("Nothing to match yet — the question text looks empty.")
+        with st.expander("✏️ What I read from the photo — fix it if it's wrong"):
+            st.text_area("Question", key=sk, height=150)
+            st.text_area("Options (one per line: A. text)", key=ok, height=200)
+            st.caption("Edit and the match updates immediately; this doesn't call the AI again.")
+            read_again("🔄 Read the photo again (calls the AI again)", f"retry_{sig}_{i}")
+
+    scan_another("bottom")
+
+
+# --------------------------------------------------------------------------- #
+# Page
+# --------------------------------------------------------------------------- #
+st.subheader("AIP-C01 · Question & Answer")
+if "view" not in st.session_state:
+    st.session_state.view = BROWSE_VIEW if st.query_params.get("q") else SCAN_VIEW
+view = st.segmented_control("View", [SCAN_VIEW, BROWSE_VIEW], key="view", label_visibility="collapsed") or SCAN_VIEW
+(scan_view if view == SCAN_VIEW else browse_view)()
