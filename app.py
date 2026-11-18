@@ -8,16 +8,19 @@ No mock exam, no timer, no scoring. Works on a phone.
 Run locally:   streamlit run app.py
 Deploy:        Streamlit Community Cloud (see README.md)
 """
+import base64
 import hashlib
 import hmac
 import html
 import os
 import re
+import time
 
 import streamlit as st
 
+import components_ui
 import scan
-from engine import PROBABLE, SURE, Index, band
+from engine import Index, decide
 from questions import QUESTIONS
 
 st.set_page_config(page_title="AIP-C01 Q&A", page_icon="🔎", layout="wide", initial_sidebar_state="collapsed")
@@ -53,6 +56,7 @@ st.markdown(
       mark{background:rgba(255,213,0,.55);color:inherit;border-radius:3px;padding:0 1px;}
       .scan-ans{margin:10px 0 14px;padding:14px 16px;border-radius:12px;font-size:1.25rem;font-weight:700;
         background:rgba(46,160,67,.16);border:2px solid rgba(46,160,67,.6);}
+      .scan-ans.warn{background:rgba(255,200,0,.14);border-color:rgba(255,200,0,.7);}
       .scan-ans small{display:block;margin-top:4px;font-size:.85rem;font-weight:500;opacity:.85;}
       @media (max-width: 640px){
         .block-container{padding:1rem .7rem 3rem;}
@@ -75,6 +79,7 @@ def get_index() -> Index:
 IDX = get_index()
 DOMAINS = list(dict.fromkeys(q["category"] for q in IDX.items))
 SCAN_VIEW, BROWSE_VIEW = "📷 Scan a question", "🔎 Browse & search"
+AUTH_DAYS = 30
 
 
 def secret(name: str, default=None):
@@ -83,6 +88,26 @@ def secret(name: str, default=None):
     except Exception:
         v = None
     return v or os.environ.get(name, default)
+
+
+# --------------------------------------------------------------------------- #
+# "Remember me": a signed token kept in the browser (see components_ui.auth_store)
+# --------------------------------------------------------------------------- #
+def _sig(pw: str, exp: int) -> str:
+    return hmac.new(str(pw).encode(), f"aipc01|v1|{exp}".encode(), hashlib.sha256).hexdigest()
+
+
+def make_token(pw: str) -> str:
+    exp = int(time.time()) + AUTH_DAYS * 86400
+    return f"{exp}.{_sig(pw, exp)}"
+
+
+def token_ok(pw: str, token: str | None) -> bool:
+    try:
+        exp_s, sig = (token or "").split(".", 1)
+        return int(exp_s) > time.time() and hmac.compare_digest(sig, _sig(pw, int(exp_s)))
+    except Exception:
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -220,6 +245,14 @@ def analyze_photo(jpeg: bytes, model: str, attempt: int, _key: str) -> dict:
     return scan.read_photo(jpeg, _key, model)
 
 
+@st.cache_data(show_spinner=False, max_entries=200)
+def ai_judge(stem: str, options: tuple, cand_ids: tuple, model: str, _key: str) -> dict:
+    """AI double-check: is one of the top candidates the same question? Cached per (text, candidates)."""
+    cands = [{"id": i, "question": IDX.by_id[i]["question"],
+              "options": [(o["letter"], o["text"]) for o in IDX.by_id[i]["opts"]]} for i in cand_ids]
+    return scan.judge_match(stem, list(options), cands, _key, model)
+
+
 def parse_options_text(text: str) -> list[tuple[str, str]]:
     """'A. foo\\nB. bar' (as edited by the user) -> [('A','foo'), ('B','bar')]."""
     out, plain = [], []
@@ -238,38 +271,96 @@ def parse_options_text(text: str) -> list[tuple[str, str]]:
     return [(l, t) for l, t in out if t]
 
 
-def show_match(matches: list[dict], options: list[tuple[str, str]]):
-    best = matches[0]
-    b, pct = band(best["score"]), round(best["score"] * 100)
-    q = IDX.by_id[best["id"]]
-    photo_text = dict(options)
+def resolve(stem: str, options: list[tuple[str, str]], matches: list[dict], key: str, model: str) -> dict:
+    """Combine the word/character match with the AI double-check.
 
-    if b == "none":
-        st.error(f"❌ **Not found in this bank.** The closest question is Q{q['id']} at only {pct}% — "
-                 "probably a different question. (If the AI misread the photo, fix the text below.)")
-        with st.expander(f"Closest question anyway: Q{q['id']} ({pct}%)"):
+    -> {'status': sure|probable|possible|none|different, 'best': match-dict|None, 'by': 'words'|'ai',
+        'reason': str, 'ai_error': str, 'to_photo': {...}}
+    """
+    status = decide(matches)
+    out = {"status": status, "best": matches[0], "by": "words", "reason": "", "ai_error": "",
+           "to_photo": matches[0]["to_photo"]}
+    if status == "sure" or matches[0]["score"] < 0.08 or len(stem.split()) + sum(len(t.split()) for _, t in options) < 6:
+        return out                                                     # confident (free) or nothing to compare
+    cand_ids = tuple(m["id"] for m in matches[:3] if m["score"] >= 0.08)
+    try:
+        with st.spinner("Double-checking with AI…"):
+            ai = ai_judge(stem, tuple(options), cand_ids, model, key)
+    except scan.ScanError as e:
+        out["ai_error"] = str(e)
+        return out
+    out["reason"] = ai["reason"]
+    if ai["id"] is None:
+        out["status"] = "different" if status in ("probable",) else "none"
+        return out
+    by_id = {m["id"]: m for m in matches}
+    best = by_id.get(ai["id"], matches[0])
+    out.update(best=best, by="ai", status="sure" if ai["confidence"] in ("high", "medium") else "probable",
+               to_photo=ai["to_photo"] or best["to_photo"])
+    return out
+
+
+def show_match(r: dict, matches: list[dict], options: list[tuple[str, str]]):
+    best, status = r["best"], r["status"]
+    q = IDX.by_id[best["id"]]
+    pct = round(best["score"] * 100)
+    photo_text = dict(options)
+    why = f"  \n*AI check: {r['reason']}*" if r["reason"] else ""
+
+    if r["ai_error"]:
+        st.caption(f"⚠️ AI double-check unavailable ({r['ai_error']}) — showing the word match only.")
+
+    if status in ("none", "different"):
+        st.error(f"❌ **Not found in this bank.** The closest question is Q{q['id']} ({pct}% word match) — "
+                 f"probably a different question.{why}  \n(If the AI misread the photo, fix the text below.)")
+        with st.expander(f"Closest question anyway: Q{q['id']}"):
             st.markdown(card(q, pct=best["score"]), unsafe_allow_html=True)
         return
 
-    (st.success if b == "sure" else st.warning)(
-        f"{'✅ Found in the bank' if b == 'sure' else '🟡 Probably this one — compare the wording'}"
-        f" — **Q{q['id']}** · {pct}% match")
+    tag = {"sure": "✅ Found in the bank", "probable": "🟡 Probably this one — compare the wording",
+           "possible": "🟠 Possibly this one — low confidence, check the wording carefully"}[status]
+    how = f" · confirmed by AI check (word match {pct}%)" if r["by"] == "ai" and status == "sure" else f" · {pct}% match"
+    (st.success if status == "sure" else st.warning)(f"{tag} — **Q{q['id']}**{how}{why}")
 
     letters = ", ".join(q["correct"])
-    mapped = [best["to_photo"].get(c) for c in q["correct"]]
+    mapped = [r["to_photo"].get(c) for c in q["correct"]]
     extra = ""
     if all(mapped):
         pl = ", ".join(sorted(mapped))
         snippet = (photo_text.get(mapped[0], "")[:70] + "…") if len(mapped) == 1 and photo_text.get(mapped[0]) else ""
         extra = (f"<small>In your photo that is option <b>{pl}</b>" + (f": “{esc(snippet)}”" if snippet else "") + "</small>")
-    st.markdown(f'<div class="scan-ans">Answer: {letters}{extra}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="scan-ans{"" if status == "sure" else " warn"}">Answer: {letters}{extra}</div>',
+                unsafe_allow_html=True)
     st.markdown(card(q, pct=best["score"]), unsafe_allow_html=True)
 
-    others = [m for m in matches[1:3] if band(m["score"]) != "none"]
+    others = [m for m in matches[:3] if m["id"] != q["id"] and m["score"] >= 0.3]
     if others:
         with st.expander("Other close matches"):
             for m in others:
                 st.markdown(card(IDX.by_id[m["id"]], pct=m["score"]), unsafe_allow_html=True)
+
+
+def scan_gate(pw) -> bool:
+    """Passcode gate that remembers you (signed token in the browser). True = allowed to scan."""
+    if not pw:
+        return True
+    store = components_ui.auth_store(set_token=st.session_state.get("save_token"),
+                                     clear=st.session_state.get("clear_token", False))
+    if not st.session_state.get("unlocked"):
+        # after an explicit sign-out the component still reports the old token for a moment: ignore it
+        if store and not st.session_state.get("clear_token") and token_ok(pw, store.get("token")):
+            st.session_state.unlocked = True
+            st.rerun()
+        if store is None:
+            st.caption("Checking saved sign-in…")
+        entered = st.text_input("Passcode to use the photo scanner", type="password", key="pw_in")
+        if entered:
+            if hmac.compare_digest(entered.encode(), str(pw).encode()):
+                st.session_state.update(unlocked=True, clear_token=False, save_token=make_token(pw))
+                st.rerun()
+            st.error("Wrong passcode.")
+        return False
+    return True
 
 
 def scan_view():
@@ -280,13 +371,7 @@ def scan_view():
     model = secret("OPENAI_MODEL", scan.DEFAULT_MODEL)
     pw = secret("APP_PASSWORD")
 
-    if pw and not st.session_state.get("unlocked"):
-        entered = st.text_input("Passcode to use the photo scanner", type="password", key="pw_in")
-        if entered:
-            if hmac.compare_digest(entered.encode(), str(pw).encode()):
-                st.session_state.unlocked = True
-                st.rerun()
-            st.error("Wrong passcode.")
+    if not scan_gate(pw):
         return
     if not key:
         with st.expander("🔑 Photo scanning needs an OpenAI API key", expanded=True):
@@ -302,26 +387,32 @@ def scan_view():
     # Two states: no photo yet -> show the camera/upload inputs; photo taken -> hide them so the
     # result sits at the top of the screen (important on a phone), with a button to scan another.
     photo = st.session_state.get("scan_img")
+    n = st.session_state.setdefault("scan_n", 0)
     if photo is None:
-        t_up, t_cam = st.tabs(["📸 Take photo / upload", "🎥 Live camera"])
-        with t_up:
-            up = st.file_uploader("Take a photo or choose an image", key="scan_up", label_visibility="collapsed",
-                                  type=["jpg", "jpeg", "png", "webp", "heic", "heif"])
-            st.caption("On a phone this opens your camera app — best quality. Good light, fill the frame, hold steady.")
+        t_cam, t_up = st.tabs(["📷 Back camera", "🖼️ Gallery / file"])
         with t_cam:
-            cam = st.camera_input("Point the camera at the question", key="scan_cam", label_visibility="collapsed")
-            st.caption("If the camera doesn't start, allow camera access for this site, or use *Take photo / upload*.")
-        picked = cam or up
-        if picked is not None:
-            st.session_state.scan_img = picked.getvalue()
-            st.rerun()
+            shot = components_ui.back_camera(key=f"cam{n}")
+            if shot and shot.get("image"):
+                st.session_state.scan_img = base64.b64decode(shot["image"].split(",", 1)[1])
+                st.rerun()
+        with t_up:
+            up = st.file_uploader("Choose a photo or screenshot", key=f"up{n}", label_visibility="collapsed",
+                                  type=["jpg", "jpeg", "png", "webp", "heic", "heif"])
+            if up is not None:
+                st.session_state.scan_img = up.getvalue()
+                st.rerun()
         st.info("**Tips:** one question per photo · include the whole question *and* all options · "
                 "avoid glare on screens · a blurry photo is fine as long as the words are legible.")
+        if pw and st.session_state.get("unlocked"):
+            if st.button("Sign out", key="signout"):
+                st.session_state.update(unlocked=False, save_token=None, clear_token=True)
+                st.rerun()
         return
 
     def scan_another(where: str):
         if st.button("📷 Scan another question", use_container_width=True, type="primary", key=f"another_{where}"):
             st.session_state.pop("scan_img", None)
+            st.session_state.scan_n = n + 1
             st.rerun()
 
     scan_another("top")
@@ -335,7 +426,7 @@ def scan_view():
     def read_again(label: str, k: str):
         if st.button(label, key=k):
             st.session_state[f"try_{sig}"] = attempt + 1
-            for name in [n for n in st.session_state if n.startswith((f"stem_{sig}", f"opts_{sig}"))]:
+            for name in [x for x in st.session_state if x.startswith((f"stem_{sig}", f"opts_{sig}"))]:
                 del st.session_state[name]
             st.rerun()
 
@@ -359,19 +450,25 @@ def scan_view():
         sk, ok = f"stem_{sig}_{i}", f"opts_{sig}_{i}"
         st.session_state.setdefault(sk, q["question"])
         st.session_state.setdefault(ok, "\n".join(f"{l}. {t}" for l, t in q["options"]))
+        stem_txt = st.session_state[sk]
         options = parse_options_text(st.session_state[ok])
-        matches = IDX.match_photo(st.session_state[sk], options)
+        matches = IDX.match_photo(stem_txt, options)
         if matches and matches[0]["score"] > 0:
-            show_match(matches, options)
+            show_match(resolve(stem_txt, options, matches, key, model), matches, options)
         else:
             st.error("Nothing to match yet — the question text looks empty.")
         with st.expander("✏️ What I read from the photo — fix it if it's wrong"):
             st.text_area("Question", key=sk, height=150)
             st.text_area("Options (one per line: A. text)", key=ok, height=200)
-            st.caption("Edit and the match updates immediately; this doesn't call the AI again.")
+            st.caption("Edit and the match updates immediately; this doesn't re-read the photo.")
             read_again("🔄 Read the photo again (calls the AI again)", f"retry_{sig}_{i}")
 
     scan_another("bottom")
+    if pw and st.session_state.get("unlocked"):
+        if st.button("Sign out", key="signout2"):
+            st.session_state.update(unlocked=False, save_token=None, clear_token=True)
+            st.session_state.pop("scan_img", None)
+            st.rerun()
 
 
 # --------------------------------------------------------------------------- #

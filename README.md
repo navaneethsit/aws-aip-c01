@@ -9,23 +9,37 @@ Photograph a question from **any** practice set. The answer does **not** need to
 
 1. A vision model (OpenAI) **reads** the question and its options. It is only asked to transcribe,
    never to answer.
-2. The app **matches** that text against the bank. If it is a question in this bank you get the
+2. The app **matches** that text against the bank with two free checks: overlapping **words** (rare
+   words count more; OCR typos are repaired; words split across lines are re-joined) and overlapping
+   **characters** (survives hyphenation and odd spacing). If it is a question in this bank you get the
    question, the **answer**, and which option letter that is **in your photo** (other sets often
    shuffle the options).
-3. If it isn't in the bank you are told so, instead of being shown a wrong answer.
+3. **When the match isn't certain, an AI double-check runs** (a short text-only call, about a twentieth of
+   a cent): it compares your photo's question with the top 3 candidates and says whether one is the
+   *same* question even if it is reworded, cropped or has shuffled options. It also maps your photo's
+   option letters onto the bank's. It never picks the answer; that always comes from the bank.
+   A 28 % word match on a clear winner is exactly the case this is for.
+4. If it isn't in the bank you are told so (with the AI's reason), instead of a wrong answer.
+
+Result colours: ✅ found (≥ 72 % words, or confirmed by the AI check) · 🟡 probably this one · 🟠
+possible (low confidence, only when the AI check isn't available) · ❌ not in the bank. A sure word match
+skips the AI call, so clear photos cost nothing extra.
 
 What it is built to survive: blurry, dark, skewed or low-resolution photos; rotated phone photos
 (EXIF is respected); a cropped question stem or a missing option; website junk around the question;
-OCR typos; and reworded questions from other sets. A match is scored; **≥ 72 % = found**,
-**52–72 % = probably this one (compare the wording)**, below that = not in the bank.
+OCR typos; hyphenated/line-wrapped words; and reworded questions from other sets.
 
 If the photo is too unreadable, the app says so and shows what it read. Open
 **✏️ What I read from the photo** to correct the text yourself; the match updates instantly and
-doesn't call the AI again.
+doesn't re-read the photo. **🔄 Read the photo again** re-runs the reader.
+
+**Back camera:** the **📷 Back camera** tab has two buttons. *Take photo* opens your phone's camera app
+on the **rear** camera (best quality, autofocus, no permission prompt). *Live view* opens an in-page
+camera that asks for the rear camera first (it falls back to any camera on laptops). **🖼️ Gallery / file**
+picks an existing photo or screenshot.
 
 Tips: one question per photo · include the whole question *and* all options · avoid glare on a
-screen · on a phone use **📸 Take photo / upload** (opens your camera app: best quality, back
-camera). **🎥 Live camera** is the in-browser camera and needs camera permission for the site.
+screen · hold steady and fill the frame.
 
 ## 🔎 Browse & search
 
@@ -47,14 +61,19 @@ Add these in **Streamlit Cloud → your app → ⋮ → Settings → Secrets** (
 ```toml
 OPENAI_API_KEY = "sk-..."          # required for photo scanning
 OPENAI_MODEL   = "gpt-5-mini"      # optional; this is the default (cheap, good at reading photos)
-APP_PASSWORD   = "choose-one"      # optional; asks for this before the scanner can be used
+APP_PASSWORD   = "choose-one"      # optional; asks for this before the scanner can be used (once per device)
 ```
+
+**Passcode:** if you set `APP_PASSWORD` you type it once; the browser then keeps a signed token for
+**30 days**, so a page refresh or a new tab doesn't ask again. **Sign out** (in the scanner) removes it.
+Changing `APP_PASSWORD` signs every device out. The token is stored in the browser's local storage.
 
 - **Model:** `gpt-5-mini` is the default. For even cheaper, try `gpt-5-nano`; if a newer small
   OpenAI model is available on your account you can set it here without changing any code.
   The app adapts if a model rejects an optional parameter.
 - **Cost:** roughly a fifth of a cent per photo (estimate; image ≈ 1–2k input tokens plus a short
-  transcription). Results are cached per image, so re-running the same photo costs nothing.
+  transcription), plus about a twentieth of a cent more when the AI double-check is needed. Results are
+  cached per image and per question text, so re-running the same photo costs nothing.
 - **Privacy:** the photo is sent to OpenAI to be read and is not stored by this app. Don't photograph
   anything you wouldn't send to OpenAI.
 - **Protect your key:** a public Streamlit app lets anyone use your key. Keep the app private
@@ -87,7 +106,8 @@ http), which Streamlit Cloud provides.
 aip-c01-qa-browser/
 ├── app.py                # UI: Scan view + Browse view
 ├── engine.py             # search + photo-matching (no Streamlit; tested on its own)
-├── scan.py               # photo preparation + OpenAI vision call
+├── scan.py               # photo preparation, OpenAI vision read, AI double-check
+├── components_ui.py      # back-camera widget + remembered sign-in (plain HTML/JS, generated at start-up)
 ├── questions.py          # question bank loader (imports the files below)
 ├── questions_extra*.py   # question data (Q1-Q149)
 ├── requirements.txt
